@@ -11,6 +11,8 @@ print(df.groupby("season").size())
 print("\nOdds ranges:")
 print(df[["odds_over25", "odds_under25"]].describe())
 
-# Make sure over25 aligns with total_goals
+# Make sure over25 aligns with total goals
+df["total_goals"] = df["home_goals"] + df["away_goals"]
 bad = df[(df["over25"] == 1) & (df["total_goals"] < 3)]
-print("\nOver25 label errors:", len(bad))
+bad2 = df[(df["over25"] == 0) & (df["total_goals"] >= 3)]
+print("\nOver25 label errors:", len(bad) + len(bad2))
