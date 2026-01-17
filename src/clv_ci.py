@@ -6,6 +6,12 @@ N_BOOT = 20000
 
 df = pd.read_csv(BET_LOG, parse_dates=["date"])
 df = df.dropna(subset=["odds_taken","odds_close"])
+
+if df.empty:
+    print("Bets: 0")
+    print("No bets to evaluate CLV.")
+    raise SystemExit(0)
+
 df = df[(df["odds_taken"] > 0) & (df["odds_close"] > 0)]
 
 log_clv = np.log(df["odds_close"].to_numpy()) - np.log(df["odds_taken"].to_numpy())

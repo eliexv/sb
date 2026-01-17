@@ -3,44 +3,26 @@ import pandas as pd
 from scipy.optimize import minimize, minimize_scalar
 from scipy.stats import poisson
 
-# -----------------------------
-# Files
-# -----------------------------
 DATA_FILE = "data/clean/epl_matches_clean.csv"
 SUMMARY_FILE = "data/clean/walkforward_summary.csv"
 BET_LOG_FILE = "data/clean/walkforward_bets_log.csv"
 
-# -----------------------------
-# Walk-forward configuration
-# -----------------------------
-TRAIN_WINDOW_SEASONS = 5       # fit on last K seasons
+TRAIN_WINDOW_SEASONS = 5
 USE_TIME_DECAY = True
-HALF_LIFE_DAYS = 365           # ignored if USE_TIME_DECAY=False
-
+HALF_LIFE_DAYS = 365
 RIDGE_ALPHA = 0.002
 MAX_GOALS = 10
 
-# -----------------------------
-# Betting configuration (development only: flat staking)
-# -----------------------------
 EV_THRESHOLD = 0.02
 STAKE_FRACTION = 0.0025
 START_BANKROLL = 1000.0
 
-# Eligibility filter: avoid teams with too little history in training window
 N_MIN_MATCHES = 25
 
-# -----------------------------
-# Blending configuration
-# -----------------------------
-# Blend: p_blend = (1-w)*p_mkt_raw + w*p_model
-# Regularize w toward BLEND_PRIOR_W (0 = "trust market unless model clearly helps")
+# Regularize w towards market unless model clearly helps
 BLEND_PRIOR_W = 0.0
-BLEND_L2 = 0.25  # increase to shrink harder toward market; decrease to let w move more
+BLEND_L2 = 0.25  # increase => w shrinks more toward 0
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def season_start_year(season: str) -> int:
     return int(season.split("-")[0])
 
@@ -48,7 +30,6 @@ def sorted_seasons(df: pd.DataFrame):
     return sorted(df["season"].unique(), key=season_start_year)
 
 def p_over25(lam_home: float, lam_away: float, max_goals: int = 10) -> float:
-    """P(total goals >= 3) under independent Poisson model."""
     ph = poisson.pmf(np.arange(0, max_goals + 1), lam_home)
     pa = poisson.pmf(np.arange(0, max_goals + 1), lam_away)
     joint = np.outer(ph, pa)
@@ -64,17 +45,15 @@ def brier(y, p) -> float:
     y = y.astype(float)
     return float(np.mean((p - y) ** 2))
 
-def market_fair_prob_over(row) -> float:
-    """De-vig implied probability for Over2.5 using Over & Under odds (kept for optional diagnostics)."""
-    po = 1.0 / row["odds_over25"]
-    pu = 1.0 / row["odds_under25"]
+def devig_over_prob(odds_over: np.ndarray, odds_under: np.ndarray) -> np.ndarray:
+    """De-vig implied P(over) from paired OU odds."""
+    po = 1.0 / odds_over
+    pu = 1.0 / odds_under
     s = po + pu
-    return po / s if s > 0 else np.nan
-
-def market_raw_prob_over(row) -> float:
-    """RAW implied probability from the price you can bet (no de-vig)."""
-    o = row["odds_over25"]
-    return (1.0 / o) if (o is not None and np.isfinite(o) and o > 0) else np.nan
+    out = np.full_like(po, np.nan, dtype=float)
+    m = np.isfinite(s) & (s > 0)
+    out[m] = po[m] / s[m]
+    return out
 
 def build_weights(dates: pd.Series) -> np.ndarray:
     if not USE_TIME_DECAY:
@@ -84,7 +63,6 @@ def build_weights(dates: pd.Series) -> np.ndarray:
     return np.power(0.5, age_days / float(HALF_LIFE_DAYS))
 
 def eligibility_filter(train: pd.DataFrame, test: pd.DataFrame) -> pd.DataFrame:
-    """Keep only matches where both teams have >= N_MIN_MATCHES appearances in training window."""
     home_counts = train["home_team"].value_counts()
     away_counts = train["away_team"].value_counts()
     team_counts = home_counts.add(away_counts, fill_value=0)
@@ -93,22 +71,10 @@ def eligibility_filter(train: pd.DataFrame, test: pd.DataFrame) -> pd.DataFrame:
     t["home_hist_matches"] = t["home_team"].map(team_counts).fillna(0).astype(int)
     t["away_hist_matches"] = t["away_team"].map(team_counts).fillna(0).astype(int)
 
-    eligible = t[
-        (t["home_hist_matches"] >= N_MIN_MATCHES) &
-        (t["away_hist_matches"] >= N_MIN_MATCHES)
-    ].copy()
-    return eligible
+    return t[(t["home_hist_matches"] >= N_MIN_MATCHES) &
+             (t["away_hist_matches"] >= N_MIN_MATCHES)].copy()
 
-# -----------------------------
-# Model fitting
-# -----------------------------
 def fit_team_poisson(train: pd.DataFrame):
-    """
-    Fit:
-      log(lambda_home) = home_adv + attack(home) + defense(away)
-      log(lambda_away) = attack(away) + defense(home)
-    Identifiability enforced by constraining last team's attack/defense so sums are 0.
-    """
     teams = sorted(set(train["home_team"]).union(set(train["away_team"])))
     n = len(teams)
     idx = {t: i for i, t in enumerate(teams)}
@@ -142,9 +108,7 @@ def fit_team_poisson(train: pd.DataFrame):
 
     x0 = np.zeros(1 + 2 * (n - 1), dtype=float)
     res = minimize(
-        nll,
-        x0,
-        method="L-BFGS-B",
+        nll, x0, method="L-BFGS-B",
         options={"maxiter": 5000, "maxfun": 50000, "ftol": 1e-9},
     )
     if not res.success:
@@ -159,7 +123,6 @@ def predict_lambdas(df_part: pd.DataFrame, teams, home_adv, attack, defense):
     hi_series = df_part["home_team"].map(idx)
     ai_series = df_part["away_team"].map(idx)
 
-    # Neutral slot for unseen teams
     attack_ext = np.append(attack, 0.0)
     defense_ext = np.append(defense, 0.0)
     neutral_idx = len(attack_ext) - 1
@@ -172,48 +135,34 @@ def predict_lambdas(df_part: pd.DataFrame, teams, home_adv, attack, defense):
     return lam_h, lam_a
 
 def best_goal_scale(cal_lam_h, cal_lam_a, y_cal):
-    """Fit a single multiplicative goal-rate scale s on the calibration season."""
-    y_cal = np.asarray(y_cal, dtype=int)
-
     def obj(log_s):
         s = np.exp(log_s)
         p = np.array([p_over25(s * lh, s * la, MAX_GOALS) for lh, la in zip(cal_lam_h, cal_lam_a)])
         return log_loss(y_cal, p)
 
-    # s in [0.50, 2.01]
     res = minimize_scalar(obj, bounds=(-0.7, 0.7), method="bounded")
     return float(np.exp(res.x))
 
-def best_blend_weight(y, p_mkt_raw, p_model):
-    """
-    Find w in [0,1] minimizing:
-      logloss(y, (1-w)*p_mkt_raw + w*p_model) + BLEND_L2*(w - BLEND_PRIOR_W)^2
-    Also drops NaNs safely.
-    """
+def best_blend_weight(y, p_ref, p_model):
     y = np.asarray(y, dtype=int)
-    p_mkt_raw = np.asarray(p_mkt_raw, dtype=float)
+    p_ref = np.asarray(p_ref, dtype=float)
     p_model = np.asarray(p_model, dtype=float)
 
-    mask = np.isfinite(p_mkt_raw) & np.isfinite(p_model) & np.isfinite(y)
+    mask = np.isfinite(y) & np.isfinite(p_ref) & np.isfinite(p_model)
     y2 = y[mask]
-    m2 = p_mkt_raw[mask]
+    r2 = p_ref[mask]
     q2 = p_model[mask]
 
     if len(y2) < 50:
-        # Too little data to estimate a stable w
         return 0.0
 
     def obj(w):
-        p = (1.0 - w) * m2 + w * q2
+        p = (1.0 - w) * r2 + w * q2
         return log_loss(y2, p) + BLEND_L2 * (w - BLEND_PRIOR_W) ** 2
 
     res = minimize_scalar(obj, bounds=(0.0, 1.0), method="bounded")
-    w = float(res.x)
-    return max(0.0, min(1.0, w))
+    return float(res.x)
 
-# -----------------------------
-# Backtest staking (development)
-# -----------------------------
 def flat_stake_backtest(bets: pd.DataFrame, bankroll_start: float) -> dict:
     bankroll = bankroll_start
     peak = bankroll
@@ -225,7 +174,7 @@ def flat_stake_backtest(bets: pd.DataFrame, bankroll_start: float) -> dict:
 
     for _, r in bets.sort_values("date").iterrows():
         stake = bankroll * STAKE_FRACTION
-        O = float(r["odds_over25"])
+        O = float(r["odds_over25_bet"])
         win = int(r["over25"]) == 1
 
         profit = stake * (O - 1.0) if win else -stake
@@ -253,36 +202,23 @@ def flat_stake_backtest(bets: pd.DataFrame, bankroll_start: float) -> dict:
         "n_bets": len(bets),
     }
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     df = pd.read_csv(DATA_FILE, parse_dates=["date"]).sort_values("date").reset_index(drop=True)
 
-    required_cols = {
-        "season", "date", "home_team", "away_team",
-        "home_goals", "away_goals", "over25",
-        "odds_over25", "odds_under25",
-        "odds_over25_close", "odds_under25_close",
+    required = {
+        "season","date","home_team","away_team","home_goals","away_goals","over25",
+        "odds_over25_bet","odds_under25_bet",
+        "odds_over25_ref_close","odds_under25_ref_close",
     }
-    missing = required_cols - set(df.columns)
+    missing = required - set(df.columns)
     if missing:
         raise RuntimeError(f"Missing required columns in clean dataset: {sorted(missing)}")
 
-    # Keep both versions around (raw for blending/EV comparisons; fair for optional diagnostics)
-    df["p_mkt_raw"] = df.apply(market_raw_prob_over, axis=1)
-    df["p_mkt_fair"] = df.apply(market_fair_prob_over, axis=1)
-
     seasons = sorted_seasons(df)
-
-    min_needed = TRAIN_WINDOW_SEASONS + 2  # train window + cal + test
+    min_needed = TRAIN_WINDOW_SEASONS + 2
     if len(seasons) < min_needed:
-        raise RuntimeError(
-            f"Not enough seasons ({len(seasons)}) for train_window={TRAIN_WINDOW_SEASONS}. "
-            f"Need at least {min_needed}."
-        )
+        raise RuntimeError(f"Not enough seasons ({len(seasons)}) for train_window={TRAIN_WINDOW_SEASONS}. Need {min_needed}.")
 
-    # We start at: first season index that allows [train_window seasons] + [cal season] before it
     start_idx = TRAIN_WINDOW_SEASONS + 1
     end_idx = len(seasons) - 1
 
@@ -291,9 +227,7 @@ def main():
     all_bets = []
 
     print(f"Seasons in data: {seasons[0]} .. {seasons[-1]}")
-    print(
-        f"Walk-forward: train_window={TRAIN_WINDOW_SEASONS} seasons | calibration=previous season | test=next season"
-    )
+    print(f"Walk-forward: train_window={TRAIN_WINDOW_SEASONS} seasons | calibration=previous season | test=next season")
     print(f"Time decay: {USE_TIME_DECAY} (half-life={HALF_LIFE_DAYS}) | ridge={RIDGE_ALPHA}")
     print(f"Eligibility: min matches={N_MIN_MATCHES} | EV threshold={EV_THRESHOLD}\n")
 
@@ -303,69 +237,65 @@ def main():
         train_seasons = seasons[t - 1 - TRAIN_WINDOW_SEASONS : t - 1]
 
         train = df[df["season"].isin(train_seasons)].copy()
-        cal = df[df["season"] == cal_season].copy()
-        test = df[df["season"] == test_season].copy()
+        cal_raw = df[df["season"] == cal_season].copy()
+        test_raw = df[df["season"] == test_season].copy()
 
-        # Fit model on train
         teams, home_adv, attack, defense = fit_team_poisson(train)
 
-        # Calibrate goal-scale on cal season
+        # Eligibility defines what you can bet on
+        cal = eligibility_filter(train, cal_raw)
+        test = eligibility_filter(train, test_raw)
+
+        # Reference probability from CLOSE reference odds (de-vig)
+        cal_ref = devig_over_prob(
+            cal["odds_over25_ref_close"].to_numpy(float),
+            cal["odds_under25_ref_close"].to_numpy(float),
+        )
+        test_ref = devig_over_prob(
+            test["odds_over25_ref_close"].to_numpy(float),
+            test["odds_under25_ref_close"].to_numpy(float),
+        )
+
+        # Model calibration: scale s on calibration season
         cal_lh, cal_la = predict_lambdas(cal, teams, home_adv, attack, defense)
-        y_cal = cal["over25"].to_numpy(dtype=int)
+        y_cal = cal["over25"].to_numpy(int)
         s = best_goal_scale(cal_lh, cal_la, y_cal)
 
-        # Predict on test
+        # Model probs on cal/test with scale s
+        cal_lh *= s
+        cal_la *= s
+        cal_model = np.array([p_over25(a, b, MAX_GOALS) for a, b in zip(cal_lh, cal_la)])
+
         lh, la = predict_lambdas(test, teams, home_adv, attack, defense)
         lh *= s
         la *= s
-        test["p_model"] = [p_over25(a, b, MAX_GOALS) for a, b in zip(lh, la)]
+        test_model = np.array([p_over25(a, b, MAX_GOALS) for a, b in zip(lh, la)])
 
-        # Market probs for the test season
-        test["p_mkt_raw"] = test.apply(market_raw_prob_over, axis=1)
-        test["p_mkt_fair"] = test.apply(market_fair_prob_over, axis=1)
+        # Blend weight w learned on calibration season vs reference close market
+        w = best_blend_weight(y_cal, cal_ref, cal_model)
 
-        # Eligibility subset (this defines the universe you actually bet in)
-        eligible = eligibility_filter(train, test)
+        # Blended probs for test
+        test = test.copy()
+        test["p_ref"] = test_ref
+        test["p_model"] = test_model
+        test["p_blend"] = (1.0 - w) * test["p_ref"] + w * test["p_model"]
 
-        # Blend weight fit on CAL season (use RAW market, because that's the tradable reference)
-        # We fit w on the calibration season, then apply to the test season.
-        cal["p_model"] = [p_over25(a * s, b * s, MAX_GOALS) for a, b in zip(cal_lh, cal_la)]
-        cal["p_mkt_raw"] = cal.apply(market_raw_prob_over, axis=1)
+        # Metrics vs reference close (NaN-safe)
+        m = np.isfinite(test["p_ref"].to_numpy(float)) & np.isfinite(test["p_blend"].to_numpy(float))
+        y = test.loc[m, "over25"].to_numpy(int)
+        ll_blend = log_loss(y, test.loc[m, "p_blend"].to_numpy(float)) if len(y) else np.nan
+        ll_ref = log_loss(y, test.loc[m, "p_ref"].to_numpy(float)) if len(y) else np.nan
 
-        w = best_blend_weight(
-            y=cal["over25"].to_numpy(dtype=int),
-            p_mkt_raw=cal["p_mkt_raw"].to_numpy(dtype=float),
-            p_model=cal["p_model"].to_numpy(dtype=float),
-        )
-
-        # Compute blended probs on eligible subset
-        eligible = eligible.copy()
-        eligible["p_model"] = eligible["p_model"].astype(float)
-        eligible["p_mkt_raw"] = eligible["p_mkt_raw"].astype(float)
-        eligible["p_blend"] = (1.0 - w) * eligible["p_mkt_raw"] + w * eligible["p_model"]
-
-        # Metrics (on eligible subset, and NaN-safe)
-        m = np.isfinite(eligible["p_mkt_raw"].to_numpy(float)) & np.isfinite(eligible["p_model"].to_numpy(float))
-        y = eligible.loc[m, "over25"].to_numpy(dtype=int)
-        p_blend = eligible.loc[m, "p_blend"].to_numpy(dtype=float)
-        p_mkt = eligible.loc[m, "p_mkt_raw"].to_numpy(dtype=float)
-
-        blend_ll = log_loss(y, p_blend) if len(y) else np.nan
-        mkt_ll = log_loss(y, p_mkt) if len(y) else np.nan
-        blend_bs = brier(y, p_blend) if len(y) else np.nan
-        mkt_bs = brier(y, p_mkt) if len(y) else np.nan
-
-        # Betting on eligible subset using MODEL probability (not blend) for EV
-        # (If you want to switch EV to p_blend later, that’s one line.)
-        eligible["ev"] = eligible["p_blend"] * eligible["odds_over25"] - 1.0
-        bets = eligible[eligible["ev"] >= EV_THRESHOLD].copy()
+        # EV uses bettable odds (open) against blended "true prob"
+        test["ev"] = test["p_blend"] * test["odds_over25_bet"] - 1.0
+        bets = test[(test["ev"] >= EV_THRESHOLD) & np.isfinite(test["p_ref"])].copy()
 
         perf = flat_stake_backtest(bets, bankroll)
         bankroll = perf["end_bankroll"]
 
         print(
             f"{test_season} | train={train_seasons[0]}..{train_seasons[-1]} cal={cal_season} | "
-            f"s={s:.3f} w={w:.3f} | LL(blend)={blend_ll:.4f} vs LL(mkt)={mkt_ll:.4f} | "
+            f"s={s:.3f} w={w:.3f} | LL(blend)={ll_blend:.4f} vs LL(ref_close)={ll_ref:.4f} | "
             f"bets={perf['n_bets']} | ROI={perf['roi']*100:.2f}%"
         )
 
@@ -376,48 +306,42 @@ def main():
             "cal_season": cal_season,
             "scale_s": s,
             "blend_w": w,
-            "eligible_matches": len(eligible),
-            "logloss_blend": blend_ll,
-            "logloss_market_raw": mkt_ll,
-            "brier_blend": blend_bs,
-            "brier_market_raw": mkt_bs,
+            "eligible_matches": len(test),
+            "logloss_blend": ll_blend,
+            "logloss_ref_close": ll_ref,
             "bets": perf["n_bets"],
             "roi": perf["roi"],
             "bankroll_end": bankroll,
         })
 
-        # Bet log for CLV + diagnostics
+        # Bet log for CLV vs reference close
         if len(bets) > 0:
             bets = bets.copy()
-            bets["odds_taken"] = bets["odds_over25"]
-            bets["odds_close"] = bets["odds_over25_close"]  # CLV scripts drop NaNs
+            bets["odds_taken"] = bets["odds_over25_bet"]
+            bets["odds_close"] = bets["odds_over25_ref_close"]  # reference close for CLV
             bets["test_season"] = test_season
 
             bet_log_cols = [
-                "date", "test_season", "home_team", "away_team",
-                "p_model", "p_mkt_raw", "p_blend",
-                "odds_taken", "odds_close",
-                "ev", "over25"
+                "date","test_season","home_team","away_team",
+                "p_ref","p_model","p_blend",
+                "odds_taken","odds_close",
+                "ev","over25"
             ]
             all_bets.append(bets[bet_log_cols])
 
-    # Save summary
-    out = pd.DataFrame(rows)
-    out.to_csv(SUMMARY_FILE, index=False)
+    pd.DataFrame(rows).to_csv(SUMMARY_FILE, index=False)
     print(f"\nSaved: {SUMMARY_FILE}")
 
-    # Save bets log (always create the file, even if empty)
     if all_bets:
-        bet_df = pd.concat(all_bets, ignore_index=True)
+        pd.concat(all_bets, ignore_index=True).to_csv(BET_LOG_FILE, index=False)
     else:
-        bet_df = pd.DataFrame(columns=[
-            "date", "test_season", "home_team", "away_team",
-            "p_model", "p_mkt_raw", "p_blend",
-            "odds_taken", "odds_close", "ev", "over25"
-        ])
-    bet_df.to_csv(BET_LOG_FILE, index=False)
-    print(f"Saved: {BET_LOG_FILE}")
+        pd.DataFrame(columns=[
+            "date","test_season","home_team","away_team",
+            "p_ref","p_model","p_blend",
+            "odds_taken","odds_close","ev","over25"
+        ]).to_csv(BET_LOG_FILE, index=False)
 
+    print(f"Saved: {BET_LOG_FILE}")
     print(f"Final bankroll: {bankroll:.2f}")
 
 if __name__ == "__main__":
