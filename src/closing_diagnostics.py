@@ -10,7 +10,15 @@ def log_loss(y, p, eps=1e-15):
 def brier(y, p):
     return float(np.mean((p-y)**2))
 
+def devig_two_way(over_odds, under_odds):
+    over = 1.0 / over_odds
+    under = 1.0 / under_odds
+    s = over + under
+    return over / s
+
 df = pd.read_csv(BET_LOG, parse_dates=["date"])
+if "has_close" in df.columns:
+    df = df[df["has_close"] == 1].copy()
 df = df.dropna(subset=["odds_taken","odds_close"])
 
 # Your model probability at time of bet (already in log as q_over25 if you kept it;
@@ -21,9 +29,8 @@ if "q_over25" not in df.columns:
 y = df["over25"].to_numpy(dtype=float)
 p_model = df["q_over25"].to_numpy(dtype=float)
 
-# Convert odds to implied probability (de-vig not possible with only over odds; still useful)
-p_taken = 1.0 / df["odds_taken"].to_numpy(dtype=float)
-p_close = 1.0 / df["odds_close"].to_numpy(dtype=float)
+p_taken = devig_two_way(df["odds_taken"].to_numpy(float), df["odds_taken_under"].to_numpy(float))
+p_close = devig_two_way(df["odds_close"].to_numpy(float), df["odds_close_under"].to_numpy(float))
 
 print("Bets:", len(df))
 print("\nProbability diagnostics on BETS:")

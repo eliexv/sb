@@ -7,7 +7,7 @@ DATA_FILE = "data/clean/epl_matches_clean.csv"
 SUMMARY_FILE = "data/clean/walkforward_summary.csv"
 BET_LOG_FILE = "data/clean/walkforward_bets_log.csv"
 
-TRAIN_WINDOW_SEASONS = 5
+TRAIN_WINDOW_SEASONS = 3
 USE_TIME_DECAY = True
 HALF_LIFE_DAYS = 365
 RIDGE_ALPHA = 0.002
@@ -23,11 +23,14 @@ N_MIN_MATCHES = 25
 BLEND_PRIOR_W = 0.0
 BLEND_L2 = 0.25  # increase => w shrinks more toward 0
 
+
 def season_start_year(season: str) -> int:
     return int(season.split("-")[0])
 
+
 def sorted_seasons(df: pd.DataFrame):
     return sorted(df["season"].unique(), key=season_start_year)
+
 
 def p_over25(lam_home: float, lam_away: float, max_goals: int = 10) -> float:
     ph = poisson.pmf(np.arange(0, max_goals + 1), lam_home)
@@ -36,14 +39,17 @@ def p_over25(lam_home: float, lam_away: float, max_goals: int = 10) -> float:
     total = np.add.outer(np.arange(0, max_goals + 1), np.arange(0, max_goals + 1))
     return float(joint[total >= 3].sum())
 
+
 def log_loss(y, p, eps=1e-15) -> float:
     p = np.clip(p, eps, 1 - eps)
     y = y.astype(float)
     return float(-(y * np.log(p) + (1 - y) * np.log(1 - p)).mean())
 
+
 def brier(y, p) -> float:
     y = y.astype(float)
     return float(np.mean((p - y) ** 2))
+
 
 def devig_over_prob(odds_over: np.ndarray, odds_under: np.ndarray) -> np.ndarray:
     """De-vig implied P(over) from paired OU odds."""
@@ -55,12 +61,14 @@ def devig_over_prob(odds_over: np.ndarray, odds_under: np.ndarray) -> np.ndarray
     out[m] = po[m] / s[m]
     return out
 
+
 def build_weights(dates: pd.Series) -> np.ndarray:
     if not USE_TIME_DECAY:
         return np.ones(len(dates), dtype=float)
     ref = dates.max()
     age_days = (ref - dates).dt.days.to_numpy(dtype=float)
     return np.power(0.5, age_days / float(HALF_LIFE_DAYS))
+
 
 def eligibility_filter(train: pd.DataFrame, test: pd.DataFrame) -> pd.DataFrame:
     home_counts = train["home_team"].value_counts()
@@ -71,8 +79,11 @@ def eligibility_filter(train: pd.DataFrame, test: pd.DataFrame) -> pd.DataFrame:
     t["home_hist_matches"] = t["home_team"].map(team_counts).fillna(0).astype(int)
     t["away_hist_matches"] = t["away_team"].map(team_counts).fillna(0).astype(int)
 
-    return t[(t["home_hist_matches"] >= N_MIN_MATCHES) &
-             (t["away_hist_matches"] >= N_MIN_MATCHES)].copy()
+    return t[
+        (t["home_hist_matches"] >= N_MIN_MATCHES)
+        & (t["away_hist_matches"] >= N_MIN_MATCHES)
+    ].copy()
+
 
 def fit_team_poisson(train: pd.DataFrame):
     teams = sorted(set(train["home_team"]).union(set(train["away_team"])))
@@ -88,8 +99,8 @@ def fit_team_poisson(train: pd.DataFrame):
 
     def unpack(x):
         home_adv = x[0]
-        a_free = x[1:1 + (n - 1)]
-        d_free = x[1 + (n - 1):1 + 2 * (n - 1)]
+        a_free = x[1 : 1 + (n - 1)]
+        d_free = x[1 + (n - 1) : 1 + 2 * (n - 1)]
         attack = np.concatenate([a_free, [-a_free.sum()]])
         defense = np.concatenate([d_free, [-d_free.sum()]])
         return home_adv, attack, defense
@@ -103,12 +114,14 @@ def fit_team_poisson(train: pd.DataFrame):
         ll = (hg * np.log(lam_h + eps) - lam_h) + (ag * np.log(lam_a + eps) - lam_a)
         wll = (w * ll).sum()
 
-        pen = RIDGE_ALPHA * (np.sum(attack ** 2) + np.sum(defense ** 2))
+        pen = RIDGE_ALPHA * (np.sum(attack**2) + np.sum(defense**2))
         return -(wll - pen)
 
     x0 = np.zeros(1 + 2 * (n - 1), dtype=float)
     res = minimize(
-        nll, x0, method="L-BFGS-B",
+        nll,
+        x0,
+        method="L-BFGS-B",
         options={"maxiter": 5000, "maxfun": 50000, "ftol": 1e-9},
     )
     if not res.success:
@@ -116,6 +129,7 @@ def fit_team_poisson(train: pd.DataFrame):
 
     home_adv, attack, defense = unpack(res.x)
     return teams, home_adv, attack, defense
+
 
 def predict_lambdas(df_part: pd.DataFrame, teams, home_adv, attack, defense):
     idx = {t: i for i, t in enumerate(teams)}
@@ -134,14 +148,21 @@ def predict_lambdas(df_part: pd.DataFrame, teams, home_adv, attack, defense):
     lam_a = np.exp(attack_ext[ai] + defense_ext[hi])
     return lam_h, lam_a
 
+
 def best_goal_scale(cal_lam_h, cal_lam_a, y_cal):
     def obj(log_s):
         s = np.exp(log_s)
-        p = np.array([p_over25(s * lh, s * la, MAX_GOALS) for lh, la in zip(cal_lam_h, cal_lam_a)])
+        p = np.array(
+            [
+                p_over25(s * lh, s * la, MAX_GOALS)
+                for lh, la in zip(cal_lam_h, cal_lam_a)
+            ]
+        )
         return log_loss(y_cal, p)
 
     res = minimize_scalar(obj, bounds=(-0.7, 0.7), method="bounded")
     return float(np.exp(res.x))
+
 
 def best_blend_weight(y, p_ref, p_model):
     y = np.asarray(y, dtype=int)
@@ -162,6 +183,7 @@ def best_blend_weight(y, p_ref, p_model):
 
     res = minimize_scalar(obj, bounds=(0.0, 1.0), method="bounded")
     return float(res.x)
+
 
 def flat_stake_backtest(bets: pd.DataFrame, bankroll_start: float) -> dict:
     bankroll = bankroll_start
@@ -202,22 +224,39 @@ def flat_stake_backtest(bets: pd.DataFrame, bankroll_start: float) -> dict:
         "n_bets": len(bets),
     }
 
+
 def main():
-    df = pd.read_csv(DATA_FILE, parse_dates=["date"]).sort_values("date").reset_index(drop=True)
+    df = (
+        pd.read_csv(DATA_FILE, parse_dates=["date"])
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
 
     required = {
-        "season","date","home_team","away_team","home_goals","away_goals","over25",
-        "odds_over25_bet","odds_under25_bet",
-        "odds_over25_ref_close","odds_under25_ref_close",
+        "season",
+        "date",
+        "home_team",
+        "away_team",
+        "home_goals",
+        "away_goals",
+        "over25",
+        "odds_over25_bet",
+        "odds_under25_bet",
+        "odds_over25_ref_close",
+        "odds_under25_ref_close",
     }
     missing = required - set(df.columns)
     if missing:
-        raise RuntimeError(f"Missing required columns in clean dataset: {sorted(missing)}")
+        raise RuntimeError(
+            f"Missing required columns in clean dataset: {sorted(missing)}"
+        )
 
     seasons = sorted_seasons(df)
     min_needed = TRAIN_WINDOW_SEASONS + 2
     if len(seasons) < min_needed:
-        raise RuntimeError(f"Not enough seasons ({len(seasons)}) for train_window={TRAIN_WINDOW_SEASONS}. Need {min_needed}.")
+        raise RuntimeError(
+            f"Not enough seasons ({len(seasons)}) for train_window={TRAIN_WINDOW_SEASONS}. Need {min_needed}."
+        )
 
     start_idx = TRAIN_WINDOW_SEASONS + 1
     end_idx = len(seasons) - 1
@@ -227,8 +266,12 @@ def main():
     all_bets = []
 
     print(f"Seasons in data: {seasons[0]} .. {seasons[-1]}")
-    print(f"Walk-forward: train_window={TRAIN_WINDOW_SEASONS} seasons | calibration=previous season | test=next season")
-    print(f"Time decay: {USE_TIME_DECAY} (half-life={HALF_LIFE_DAYS}) | ridge={RIDGE_ALPHA}")
+    print(
+        f"Walk-forward: train_window={TRAIN_WINDOW_SEASONS} seasons | calibration=previous season | test=next season"
+    )
+    print(
+        f"Time decay: {USE_TIME_DECAY} (half-life={HALF_LIFE_DAYS}) | ridge={RIDGE_ALPHA}"
+    )
     print(f"Eligibility: min matches={N_MIN_MATCHES} | EV threshold={EV_THRESHOLD}\n")
 
     for t in range(start_idx, end_idx + 1):
@@ -246,12 +289,28 @@ def main():
         cal = eligibility_filter(train, cal_raw)
         test = eligibility_filter(train, test_raw)
 
-        # Reference probability from CLOSE reference odds (de-vig)
+        # -----------------------------
+        # Market probability available at BET TIME (OPEN odds)
+        # IMPORTANT: do NOT use closing odds here (that would be lookahead leakage).
+        # -----------------------------
         cal_ref = devig_over_prob(
+            cal["odds_over25_bet"].to_numpy(float),
+            cal["odds_under25_bet"].to_numpy(float),
+        )
+        test_ref = devig_over_prob(
+            test["odds_over25_bet"].to_numpy(float),
+            test["odds_under25_bet"].to_numpy(float),
+        )
+
+        # -----------------------------
+        # Closing-market probability (CLOSE odds) - EVALUATION ONLY
+        # Used only for logging/diagnostics/CLV, never for EV selection.
+        # -----------------------------
+        cal_close = devig_over_prob(
             cal["odds_over25_ref_close"].to_numpy(float),
             cal["odds_under25_ref_close"].to_numpy(float),
         )
-        test_ref = devig_over_prob(
+        test_close = devig_over_prob(
             test["odds_over25_ref_close"].to_numpy(float),
             test["odds_under25_ref_close"].to_numpy(float),
         )
@@ -264,7 +323,9 @@ def main():
         # Model probs on cal/test with scale s
         cal_lh *= s
         cal_la *= s
-        cal_model = np.array([p_over25(a, b, MAX_GOALS) for a, b in zip(cal_lh, cal_la)])
+        cal_model = np.array(
+            [p_over25(a, b, MAX_GOALS) for a, b in zip(cal_lh, cal_la)]
+        )
 
         lh, la = predict_lambdas(test, teams, home_adv, attack, defense)
         lh *= s
@@ -281,10 +342,22 @@ def main():
         test["p_blend"] = (1.0 - w) * test["p_ref"] + w * test["p_model"]
 
         # Metrics vs reference close (NaN-safe)
-        m = np.isfinite(test["p_ref"].to_numpy(float)) & np.isfinite(test["p_blend"].to_numpy(float))
+        m = np.isfinite(test["p_ref"].to_numpy(float)) & np.isfinite(
+            test["p_blend"].to_numpy(float)
+        )
         y = test.loc[m, "over25"].to_numpy(int)
-        ll_blend = log_loss(y, test.loc[m, "p_blend"].to_numpy(float)) if len(y) else np.nan
+        ll_blend = (
+            log_loss(y, test.loc[m, "p_blend"].to_numpy(float)) if len(y) else np.nan
+        )
         ll_ref = log_loss(y, test.loc[m, "p_ref"].to_numpy(float)) if len(y) else np.nan
+        ll_open = (
+            log_loss(y, test.loc[m, "p_ref"].to_numpy(float)) if len(y) else np.nan
+        )
+
+        # also compute vs close market on the same subset (if finite)
+        mc = np.isfinite(test_close) & m
+        y_c = test.loc[mc, "over25"].to_numpy(int)
+        ll_close = log_loss(y_c, test_close[mc]) if len(y_c) else np.nan
 
         # EV uses bettable odds (open) against blended "true prob"
         test["ev"] = test["p_blend"] * test["odds_over25_bet"] - 1.0
@@ -295,38 +368,57 @@ def main():
 
         print(
             f"{test_season} | train={train_seasons[0]}..{train_seasons[-1]} cal={cal_season} | "
-            f"s={s:.3f} w={w:.3f} | LL(blend)={ll_blend:.4f} vs LL(ref_close)={ll_ref:.4f} | "
+            f"s={s:.3f} w={w:.3f} | LL(blend)={ll_blend:.4f} vs LL(open)={ll_open:.4f} vs LL(close)={ll_close:.4f} | "
             f"bets={perf['n_bets']} | ROI={perf['roi']*100:.2f}%"
         )
 
-        rows.append({
-            "test_season": test_season,
-            "train_start": train_seasons[0],
-            "train_end": train_seasons[-1],
-            "cal_season": cal_season,
-            "scale_s": s,
-            "blend_w": w,
-            "eligible_matches": len(test),
-            "logloss_blend": ll_blend,
-            "logloss_ref_close": ll_ref,
-            "bets": perf["n_bets"],
-            "roi": perf["roi"],
-            "bankroll_end": bankroll,
-        })
+        rows.append(
+            {
+                "test_season": test_season,
+                "train_start": train_seasons[0],
+                "train_end": train_seasons[-1],
+                "cal_season": cal_season,
+                "scale_s": s,
+                "blend_w": w,
+                "eligible_matches": len(test),
+                "logloss_blend": ll_blend,
+                "logloss_ref": ll_ref,
+                "bets": perf["n_bets"],
+                "roi": perf["roi"],
+                "bankroll_end": bankroll,
+            }
+        )
 
         # Bet log for CLV vs reference close
         if len(bets) > 0:
             bets = bets.copy()
             bets["odds_taken"] = bets["odds_over25_bet"]
-            bets["odds_close"] = bets["odds_over25_ref_close"]  # reference close for CLV
+            bets["odds_close"] = bets["odds_over25_ref_close"]
+            bets["has_close"] = np.isfinite(bets["odds_close"]).astype(int)
+            # Also log the UNDER odds so we can de-vig taken/close probabilities properly
+            bets["odds_taken_under"] = bets["odds_under25_bet"]
+            bets["odds_close_under"] = bets["odds_under25_ref_close"]
             bets["test_season"] = test_season
+            bets["q_over25"] = bets["p_model"]
 
             bet_log_cols = [
-                "date","test_season","home_team","away_team",
-                "p_ref","p_model","p_blend",
-                "odds_taken","odds_close",
-                "ev","over25"
+                "date",
+                "test_season",
+                "home_team",
+                "away_team",
+                "p_ref",
+                "p_model",
+                "p_blend",
+                "q_over25",
+                "odds_taken",
+                "odds_close",
+                "odds_taken_under",
+                "odds_close_under",
+                "has_close",
+                "ev",
+                "over25",
             ]
+
             all_bets.append(bets[bet_log_cols])
 
     pd.DataFrame(rows).to_csv(SUMMARY_FILE, index=False)
@@ -335,14 +427,27 @@ def main():
     if all_bets:
         pd.concat(all_bets, ignore_index=True).to_csv(BET_LOG_FILE, index=False)
     else:
-        pd.DataFrame(columns=[
-            "date","test_season","home_team","away_team",
-            "p_ref","p_model","p_blend",
-            "odds_taken","odds_close","ev","over25"
-        ]).to_csv(BET_LOG_FILE, index=False)
+        pd.DataFrame(
+            columns=[
+                "date",
+                "test_season",
+                "home_team",
+                "away_team",
+                "p_ref",
+                "p_model",
+                "p_blend",
+                "q_over25",
+                "odds_taken",
+                "odds_close",
+                "has_close",
+                "ev",
+                "over25",
+            ]
+        ).to_csv(BET_LOG_FILE, index=False)
 
     print(f"Saved: {BET_LOG_FILE}")
     print(f"Final bankroll: {bankroll:.2f}")
+
 
 if __name__ == "__main__":
     main()
